@@ -1,3 +1,4 @@
+const _ = require('lodash');
 const debug = require('debug')('grpc-express');
 const config = require('rc')('grpc-express', {
   proxyUnaryCalls: true,
@@ -9,9 +10,11 @@ const config = require('rc')('grpc-express', {
 function toUpperCaseFirstLetter(string) {
   return string.charAt(0).toUpperCase() + string.slice(1);
 }
+
 function toLowerCaseFirstLetter(string) {
   return string.charAt(0).toLowerCase() + string.slice(1);
 }
+
 function routeToPathKeys(route) {
   const functionName = route.split('/').slice(-1)[0];
   return {
@@ -36,7 +39,7 @@ class Middleware {
             .filter(
               route =>
                 !grpcClient[route].requestStream &&
-                !grpcClient[route].responseStream
+            !grpcClient[route].responseStream
             )
             .map(route => grpcClient[route].path)
         )
@@ -56,7 +59,7 @@ class Middleware {
             .filter(
               route =>
                 !grpcClient[route].requestStream &&
-                grpcClient[route].responseStream
+            grpcClient[route].responseStream
             )
             .map(route => grpcClient[route].path)
         )
@@ -71,89 +74,68 @@ class Middleware {
     }
   }
 
-  proxy(req, res, next) {
-    if (this._unaryCalls.has(req.path)) this.proxyUnaryCall(req, res);
-    else if (this._serverStreamCalls.has(req.path))
-      this.proxyServerStreamCall(req, res);
-    else next();
+  proxy(socket, next) {
+    this._unaryCalls.forEach((name, path) => {
+      socket.on(path, this.proxyUnaryCall.bind(this, socket, name, path));
+    });
+    this._serverStreamCalls.forEach((name, path) => {
+      socket.on(path, this.proxyServerStreamCall.bind(this, socket, name, path));
+    });
+    next();
   }
 
-  proxyUnaryCall(req, res) {
+  proxyUnaryCall(socket, name, path, args, ack) {
+    if (!this.checkArgs(socket, name, path, args, ack)) return;
     let timedout = false;
     // look at https://github.com/grpc/grpc/issues/9973
     // gRPC's node sdk is potato quality. it does not pass up the error.
     let timer = setTimeout(() => {
       timedout = true;
-      res.status(504);
-      res.end();
+      ack(new Error('timed out'));
     }, this._opts.unaryCallsTimeout);
-    (async () => {
-      debug('gRPC unary proxy request', req);
-      res.setHeader('Content-Type', 'application/json');
-      const grpcRequest = await this.getBody(req).catch(err => {
-        res.status(400).send(err);
-      });
-      if (!grpcRequest) return;
-      this._grpcClient[this._unaryCalls.get(req.path)](
-        grpcRequest,
-        (err, response) => {
-          if (timedout) {
-            debug('gRPC call already timedout');
-            return;
-          }
-          debug('gRPC unary end', err, response);
-          if (err) res.status(502).send(err);
-          else res.json(response);
-          clearTimeout(timer);
+    debug('gRPC unary proxy request', path);
+    this._grpcClient[this._unaryCalls.get(path)](
+      args,
+      (err, response) => {
+        if (timedout) {
+          debug('gRPC call already timedout');
+          return;
         }
-      );
-    })();
+        debug('gRPC unary end', err, response);
+        if (err) ack(new Error(err));
+        else ack(response);
+        clearTimeout(timer);
+      }
+    );
   }
 
-  proxyServerStreamCall(req, res) {
-    (async () => {
-      debug('gRPC server stream proxy request', req);
-      res.setHeader('Content-Type', 'application/json');
-      const grpcRequest = await this.getBody(req).catch(err => {
-        res.status(400).send(err);
-      });
-      if (!grpcRequest) return;
-      const stream = this._grpcClient[this._serverStreamCalls.get(req.path)](
-        grpcRequest
-      );
-      let firstChunk = true;
-      res.write('[');
-      stream.on('data', chunk => {
-        debug('gRPC server stream chunk', chunk);
-        if (!firstChunk) res.write(',');
-        res.write(JSON.stringify(chunk));
-        firstChunk = false;
-      });
-      stream.on('end', () => {
-        debug('gRPC server stream end');
-        res.write(']');
-        res.end();
-      });
-    })();
-  }
-
-  async getBody(req) {
-    return new Promise((resolve, reject) => {
-      let body = '';
-      req.on('data', chunk => {
-        body += chunk.toString();
-      });
-      req.on('end', () => {
-        try {
-          body = JSON.parse(body);
-          debug('gRPC request body read', body);
-          resolve(body);
-        } catch (err) {
-          debug('gRPC request body fail', err);
-          reject(err);
-        }
-      });
+  proxyServerStreamCall(socket, name, path, args, ack) {
+    if (!this.checkArgs(socket, name, path, args, ack)) return;
+    debug('gRPC server stream proxy request', path);
+    const stream = this._grpcClient[this._serverStreamCalls.get(path)](args);
+    stream.on('data', chunk => {
+      debug('gRPC server stream chunk', chunk);
+      // ack(chunk); // TODO
     });
+    stream.on('end', () => {
+      debug('gRPC server stream end');
+      // ack(null); // TODO
+    });
+  }
+
+  checkArgs(socket, name, path, args, ack) {
+    let passed = true;
+    if (!_.isObject(args)) {
+      socket.emit('Error', 'arguments must be an object', path);
+      debug('arguments must be an object', path, socket.id);
+      passed = false;
+    }
+    if (!_.isFunction(ack)) {
+      socket.emit('Error', 'rpc call must register ack', path);
+      debug('rpc call must register ack', path, socket.id);
+      passed = false;
+    }
+    return passed;
   }
 }
 
